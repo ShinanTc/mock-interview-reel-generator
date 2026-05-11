@@ -7,7 +7,7 @@ Change values here; nothing else needs to be touched.
 
 from pathlib import Path
 
-# ── Project root (resolved relative to this file) ─────────────────────────────
+# ── Project root ───────────────────────────────────────────────────────────────
 ROOT = Path(__file__).parent
 
 # ── Asset directories ──────────────────────────────────────────────────────────
@@ -37,7 +37,7 @@ FONT_SIZE_RATIO = 0.065       # relative to OUT_W (~70 px at 1080 wide)
 WHISPER_MODEL = "base"
 
 # ── Difficulty scene ───────────────────────────────────────────────────────────
-DIFFICULTY_DURATION = 3.0                         # max seconds; actual = min(riser, this)
+DIFFICULTY_DURATION = 3.0
 VALID_DIFFICULTIES  = ("easy", "medium", "hard")
 
 # ── Video export ───────────────────────────────────────────────────────────────
