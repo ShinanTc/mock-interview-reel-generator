@@ -14,7 +14,8 @@ build_intro_scene      – random video + random audio + word-synced subtitles
 build_difficulty_scene – difficulty PNG held for ≤ DIFFICULTY_DURATION seconds
                          over sfx/riser.mp3
 build_question_scene   – question PNG scaled to 9:16, slides in from the right
-                         on top of a frozen difficulty background
+                         on top of a frozen difficulty background, with a woosh
+                         SFX synced to the slide animation
 """
 
 import numpy as np
@@ -23,6 +24,7 @@ from PIL import Image
 from moviepy import (
     AudioArrayClip,
     AudioFileClip,
+    CompositeAudioClip,       # ← added for woosh mix
     CompositeVideoClip,
     ImageClip,
     VideoFileClip,
@@ -44,6 +46,7 @@ from utils import pick_random_file, print_step
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
+
 
 def build_intro_scene() -> tuple[CompositeVideoClip, AudioFileClip]:
     """
@@ -134,6 +137,11 @@ def build_question_scene(
     its resting position (x = 0) over `slide_duration` seconds, then holds
     still for the remainder of `duration`.
 
+    A woosh SFX (sfx/woosh.mp3) plays in sync with the slide-in and is mixed
+    on top of a silent bed that fills the entire scene duration.  If the woosh
+    file is longer than `slide_duration` it is trimmed; if it is shorter it
+    plays naturally and is padded with silence.
+
     Args:
         image_path:     Path to the PNG/JPG inside the questions/ folder.
         bg_clip:        The difficulty clip — its last frame is frozen and used
@@ -144,46 +152,79 @@ def build_question_scene(
         fps:            Frame rate — should match OUTPUT_FPS from config.
 
     Returns:
-        (video_clip, audio_clip) — silent audio matches the other scene builders.
+        (video_clip, audio_clip) — audio contains the woosh mixed over silence.
     """
+    AUDIO_FPS = 44_100
+
     # ── 1. Freeze last frame of the difficulty clip as the background ──────────
-    #   Snapping one frame before the very end avoids any edge-case blank frame.
     last_frame_t = max(0.0, bg_clip.duration - 1 / fps)
-    last_frame   = bg_clip.get_frame(last_frame_t)          # numpy (H, W, 3)
-    bg           = ImageClip(last_frame, duration=duration)
+    last_frame = bg_clip.get_frame(last_frame_t)          # numpy (H, W, 3)
+    bg = ImageClip(last_frame, duration=duration)
     print(f"   BG frozen at   : t={last_frame_t:.3f} s  ({bg.w}×{bg.h})")
 
     # ── 2. Load question image and scale to full 9:16 frame ───────────────────
-    #   resized() stretches to exactly OUT_W × OUT_H, eliminating all empty
-    #   space. Swap for .resized(height=OUT_H) if you want to preserve
-    #   aspect ratio and accept small side bars instead.
     img = ImageClip(str(image_path), duration=duration).resized((OUT_W, OUT_H))
     print(f"   Question image : {img.w}×{img.h}  (scaled to frame)")
 
     # ── 3. Animate position: slide in from the RIGHT edge ─────────────────────
-    #   Starting offset = OUT_W → image is fully off-screen at t=0.
-    #   After slide_duration the image rests at (0, 0), filling the frame.
     def _slide_position(t: float):
         if t >= slide_duration:
             return (0, 0)
-        eased = 1 - (1 - t / slide_duration) ** 2   # ease-out quadratic
-        return (int(OUT_W * (1 - eased)), 0)         # OUT_W → 0
+        eased = 1 - (1 - t / slide_duration) ** 2        # ease-out quadratic
+        return (int(OUT_W * (1 - eased)), 0)              # OUT_W → 0
 
     animated = img.with_position(_slide_position)
 
     # ── 4. Composite: frozen difficulty bg + animated question on top ──────────
     video = CompositeVideoClip([bg, animated], size=(OUT_W, OUT_H)).with_fps(fps)
 
-    # ── 5. Silent stereo audio (MoviePy 2.x AudioArrayClip) ───────────────────
-    AUDIO_FPS   = 44_100
-    n_samples   = int(duration * AUDIO_FPS)
-    silence_arr = np.zeros((n_samples, 2), dtype=np.float32)   # (samples, channels)
-    silence     = AudioArrayClip(silence_arr, fps=AUDIO_FPS)
+    # ── 5. Build audio: silent bed + woosh synced to the slide-in ─────────────
+    #
+    #   Strategy
+    #   --------
+    #   a) Create a full-duration silence array (the "bed").
+    #   b) Load woosh.mp3; trim it to slide_duration so it never bleeds past
+    #      the animation window (trim can be skipped — it still sounds great
+    #      if the woosh is shorter than slide_duration).
+    #   c) Set the woosh to start at t=0 via .with_start(0).
+    #   d) Mix with CompositeAudioClip; MoviePy sums the two tracks sample-by-
+    #      sample, giving a natural blend without clipping artefacts.
 
-    return video, silence
+    # Silent bed — full scene length
+    n_samples = int(duration * AUDIO_FPS)
+    silence_arr = np.zeros((n_samples, 2), dtype=np.float32)
+    silence_bed = AudioArrayClip(silence_arr, fps=AUDIO_FPS)
+
+    # Woosh SFX
+    woosh_path = SFX_DIR / "woosh.mp3"
+    if woosh_path.exists():
+        print_step("🔊", f"Loading woosh SFX → {woosh_path.name}")
+        woosh = AudioFileClip(str(woosh_path))
+        print(f"   Woosh duration : {woosh.duration:.2f} s  "
+              f"(slide window: {slide_duration:.2f} s)")
+
+        # Trim if the woosh is longer than the slide animation so it doesn't
+        # bleed into the "question is just sitting there" part of the scene.
+        if woosh.duration > slide_duration:
+            woosh = woosh.subclipped(0, slide_duration)
+            print(f"   Woosh trimmed  : to {slide_duration:.2f} s")
+
+        # Start at t=0 — perfectly in sync with the first frame of the slide.
+        woosh = woosh.with_start(0)
+
+        # Mix: silence provides the full-duration container; woosh layers on top.
+        scene_audio = CompositeAudioClip([silence_bed, woosh]).with_duration(duration)
+        print(f"   Scene audio    : woosh mixed over {duration:.2f} s silence")
+    else:
+        # Graceful fallback — pipeline continues without the SFX.
+        print(f"   ⚠️  Woosh SFX not found at {woosh_path} — using silence.")
+        scene_audio = silence_bed
+
+    return video, scene_audio
 
 
 # ── Private helpers ────────────────────────────────────────────────────────────
+
 
 def _load_and_reframe_video(video_path) -> VideoFileClip:
     """Load a video file and reframe it to 9:16."""
