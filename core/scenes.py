@@ -13,11 +13,15 @@ Scenes
 build_intro_scene      – random video + random audio + word-synced subtitles
 build_difficulty_scene – difficulty PNG held for ≤ DIFFICULTY_DURATION seconds
                          over sfx/riser.mp3
+build_question_scene   – question PNG scaled to 9:16, slides in from the right
+                         on top of a frozen difficulty background
 """
 
 import numpy as np
+from pathlib import Path
 from PIL import Image
 from moviepy import (
+    AudioArrayClip,
     AudioFileClip,
     CompositeVideoClip,
     ImageClip,
@@ -110,6 +114,73 @@ def build_difficulty_scene(difficulty: str) -> tuple[CompositeVideoClip, AudioFi
     ).with_duration(scene_duration)
 
     return diff_silent, riser_audio
+
+
+def build_question_scene(
+    image_path: Path,
+    bg_clip: CompositeVideoClip,
+    duration: float = 5.0,
+    slide_duration: float = 0.45,
+    fps: int = 30,
+) -> tuple:
+    """
+    Load a question image and animate it sliding in from the right edge,
+    composited on top of a frozen still from the difficulty scene.
+
+    The question image is scaled to fill the full 9:16 frame (OUT_W × OUT_H)
+    so there are no empty bars or black borders around it.
+
+    The slide animation starts fully off-screen (x = +OUT_W) and eases into
+    its resting position (x = 0) over `slide_duration` seconds, then holds
+    still for the remainder of `duration`.
+
+    Args:
+        image_path:     Path to the PNG/JPG inside the questions/ folder.
+        bg_clip:        The difficulty clip — its last frame is frozen and used
+                        as the background so the question feels like it slides
+                        in ON TOP of the difficulty image.
+        duration:       Total display time of the question slide (seconds).
+        slide_duration: How long the slide-in animation takes (seconds).
+        fps:            Frame rate — should match OUTPUT_FPS from config.
+
+    Returns:
+        (video_clip, audio_clip) — silent audio matches the other scene builders.
+    """
+    # ── 1. Freeze last frame of the difficulty clip as the background ──────────
+    #   Snapping one frame before the very end avoids any edge-case blank frame.
+    last_frame_t = max(0.0, bg_clip.duration - 1 / fps)
+    last_frame   = bg_clip.get_frame(last_frame_t)          # numpy (H, W, 3)
+    bg           = ImageClip(last_frame, duration=duration)
+    print(f"   BG frozen at   : t={last_frame_t:.3f} s  ({bg.w}×{bg.h})")
+
+    # ── 2. Load question image and scale to full 9:16 frame ───────────────────
+    #   resized() stretches to exactly OUT_W × OUT_H, eliminating all empty
+    #   space. Swap for .resized(height=OUT_H) if you want to preserve
+    #   aspect ratio and accept small side bars instead.
+    img = ImageClip(str(image_path), duration=duration).resized((OUT_W, OUT_H))
+    print(f"   Question image : {img.w}×{img.h}  (scaled to frame)")
+
+    # ── 3. Animate position: slide in from the RIGHT edge ─────────────────────
+    #   Starting offset = OUT_W → image is fully off-screen at t=0.
+    #   After slide_duration the image rests at (0, 0), filling the frame.
+    def _slide_position(t: float):
+        if t >= slide_duration:
+            return (0, 0)
+        eased = 1 - (1 - t / slide_duration) ** 2   # ease-out quadratic
+        return (int(OUT_W * (1 - eased)), 0)         # OUT_W → 0
+
+    animated = img.with_position(_slide_position)
+
+    # ── 4. Composite: frozen difficulty bg + animated question on top ──────────
+    video = CompositeVideoClip([bg, animated], size=(OUT_W, OUT_H)).with_fps(fps)
+
+    # ── 5. Silent stereo audio (MoviePy 2.x AudioArrayClip) ───────────────────
+    AUDIO_FPS   = 44_100
+    n_samples   = int(duration * AUDIO_FPS)
+    silence_arr = np.zeros((n_samples, 2), dtype=np.float32)   # (samples, channels)
+    silence     = AudioArrayClip(silence_arr, fps=AUDIO_FPS)
+
+    return video, silence
 
 
 # ── Private helpers ────────────────────────────────────────────────────────────
