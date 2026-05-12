@@ -119,7 +119,7 @@ def build_difficulty_scene(difficulty: str) -> tuple[CompositeVideoClip, AudioFi
 def build_question_scene(
     image_path: Path,
     bg_clip: CompositeVideoClip,
-    duration: float = 5.0,
+    duration: float = 10,
     slide_duration: float = 0.45,
     fps: int = 30,
 ) -> tuple:
