@@ -15,19 +15,22 @@ build_difficulty_scene – difficulty PNG held for ≤ DIFFICULTY_DURATION secon
                          over sfx/riser.mp3
 build_question_scene   – question PNG scaled to 9:16, slides in from the right
                          on top of a frozen difficulty background, with a woosh
-                         SFX synced to the slide animation
+                         SFX synced to the slide animation and a looped timer
+                         SFX playing during the hold window
 """
 
+import math
 import numpy as np
 from pathlib import Path
 from PIL import Image
 from moviepy import (
     AudioArrayClip,
     AudioFileClip,
-    CompositeAudioClip,       # ← added for woosh mix
+    CompositeAudioClip,
     CompositeVideoClip,
     ImageClip,
     VideoFileClip,
+    concatenate_audioclips,
 )
 
 from config import (
@@ -137,10 +140,12 @@ def build_question_scene(
     its resting position (x = 0) over `slide_duration` seconds, then holds
     still for the remainder of `duration`.
 
-    A woosh SFX (sfx/woosh.mp3) plays in sync with the slide-in and is mixed
-    on top of a silent bed that fills the entire scene duration.  If the woosh
-    file is longer than `slide_duration` it is trimmed; if it is shorter it
-    plays naturally and is padded with silence.
+    Audio layers
+    ------------
+    - Silence bed  : full scene length — keeps all clips at a consistent size.
+    - Woosh SFX    : plays at t=0, synced to the slide-in animation.
+    - Timer SFX    : loops from t=slide_duration to t=duration, filling the
+                     window where the question sits still on screen.
 
     Args:
         image_path:     Path to the PNG/JPG inside the questions/ folder.
@@ -152,7 +157,8 @@ def build_question_scene(
         fps:            Frame rate — should match OUTPUT_FPS from config.
 
     Returns:
-        (video_clip, audio_clip) — audio contains the woosh mixed over silence.
+        (video_clip, audio_clip) — audio contains woosh + looped timer mixed
+        over a silent bed.
     """
     AUDIO_FPS = 44_100
 
@@ -178,24 +184,28 @@ def build_question_scene(
     # ── 4. Composite: frozen difficulty bg + animated question on top ──────────
     video = CompositeVideoClip([bg, animated], size=(OUT_W, OUT_H)).with_fps(fps)
 
-    # ── 5. Build audio: silent bed + woosh synced to the slide-in ─────────────
+    # ── 5. Build audio ─────────────────────────────────────────────────────────
     #
-    #   Strategy
-    #   --------
-    #   a) Create a full-duration silence array (the "bed").
-    #   b) Load woosh.mp3; trim it to slide_duration so it never bleeds past
-    #      the animation window (trim can be skipped — it still sounds great
-    #      if the woosh is shorter than slide_duration).
-    #   c) Set the woosh to start at t=0 via .with_start(0).
-    #   d) Mix with CompositeAudioClip; MoviePy sums the two tracks sample-by-
-    #      sample, giving a natural blend without clipping artefacts.
+    #   Layers (all mixed via CompositeAudioClip):
+    #
+    #     [silence bed]  0 ──────────────────────────────────────── duration
+    #     [woosh]        0 ── slide_duration
+    #     [timer loop]             slide_duration ─────────────── duration
+    #
+    #   The silence bed acts as a full-length container so MoviePy never has
+    #   to guess the clip length from a shorter audio source.
+
+    hold_duration = duration - slide_duration   # seconds the slide sits still
 
     # Silent bed — full scene length
-    n_samples = int(duration * AUDIO_FPS)
+    n_samples   = int(duration * AUDIO_FPS)
     silence_arr = np.zeros((n_samples, 2), dtype=np.float32)
     silence_bed = AudioArrayClip(silence_arr, fps=AUDIO_FPS)
 
-    # Woosh SFX
+    # Start with just the silence bed; append real layers as they are found.
+    audio_layers = [silence_bed]
+
+    # ── Woosh SFX (slide-in window, t=0) ──────────────────────────────────────
     woosh_path = SFX_DIR / "woosh.mp3"
     if woosh_path.exists():
         print_step("🔊", f"Loading woosh SFX → {woosh_path.name}")
@@ -210,20 +220,48 @@ def build_question_scene(
             print(f"   Woosh trimmed  : to {slide_duration:.2f} s")
 
         # Start at t=0 — perfectly in sync with the first frame of the slide.
-        woosh = woosh.with_start(0)
-
-        # Mix: silence provides the full-duration container; woosh layers on top.
-        scene_audio = CompositeAudioClip([silence_bed, woosh]).with_duration(duration)
-        print(f"   Scene audio    : woosh mixed over {duration:.2f} s silence")
+        audio_layers.append(woosh.with_start(0))
     else:
-        # Graceful fallback — pipeline continues without the SFX.
-        print(f"   ⚠️  Woosh SFX not found at {woosh_path} — using silence.")
-        scene_audio = silence_bed
+        print(f"   ⚠️  Woosh SFX not found at {woosh_path} — skipping.")
+
+    # ── Timer SFX (looped over the hold window, t=slide_duration → end) ───────
+    timer_path = SFX_DIR / "timer.mp3"
+    if timer_path.exists():
+        print_step("⏱ ", f"Loading timer SFX → {timer_path.name}")
+        timer_raw = AudioFileClip(str(timer_path))
+        print(f"   Timer duration : {timer_raw.duration:.2f} s  "
+              f"(hold window: {hold_duration:.2f} s)")
+
+        # Loop until the clip fills the full hold window, then hard-trim.
+        timer_looped = _loop_audio_to(timer_raw, hold_duration)
+
+        # Shift so it starts exactly when the slide animation finishes.
+        audio_layers.append(timer_looped.with_start(slide_duration))
+        print(f"   Timer looped   : {hold_duration:.2f} s  "
+              f"starting at t={slide_duration:.2f} s")
+    else:
+        print(f"   ⚠️  Timer SFX not found at {timer_path} — skipping.")
+
+    scene_audio = CompositeAudioClip(audio_layers).with_duration(duration)
+    print(f"   Scene audio    : {len(audio_layers)} layer(s) mixed over "
+          f"{duration:.2f} s")
 
     return video, scene_audio
 
 
 # ── Private helpers ────────────────────────────────────────────────────────────
+
+
+def _loop_audio_to(clip: AudioFileClip, target_duration: float) -> AudioFileClip:
+    """
+    Repeat `clip` end-to-end until it reaches `target_duration`, then trim.
+
+    Uses concatenate_audioclips so the loop boundary is sample-accurate and
+    there are no pitch/speed artefacts from MoviePy's built-in looping helpers.
+    """
+    repeats = math.ceil(target_duration / clip.duration)
+    looped  = concatenate_audioclips([clip] * repeats)
+    return looped.subclipped(0, target_duration)
 
 
 def _load_and_reframe_video(video_path) -> VideoFileClip:
