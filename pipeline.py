@@ -15,6 +15,7 @@ Orchestrates the full reel-generation pipeline.
 """
 
 import os
+import random
 from pathlib import Path
 
 from moviepy import concatenate_audioclips, concatenate_videoclips
@@ -28,7 +29,7 @@ from core.scenes import (
 )
 from utils import print_step
 
-# Folder that holds the question images (one per difficulty, or a single image).
+# Folder that holds the question images (1.png, 2.png, 3.png).
 QUESTIONS_DIR = Path(__file__).parent / "questions"
 
 # Folder that holds comment audio files (1.mp3, 2.mp3, …).
@@ -98,11 +99,16 @@ def _resolve_question_image(difficulty: str) -> Path:
     """
     Look for a question image inside the `questions/` folder.
 
-    Resolution order (first match wins):
-      1. questions/<difficulty>.png   — difficulty-specific image
-      2. questions/<difficulty>.jpg
-      3. questions/question.png       — generic fallback
-      4. questions/question.jpg
+    Picks randomly from numbered images (1.png, 2.png, 3.png, …) if any
+    exist.  Falls back to difficulty-named and generic filenames if no
+    numbered files are found.
+
+    Resolution order:
+      1. Random pick from questions/<N>.png / <N>.jpg  (N is an integer)
+      2. questions/<difficulty>.png
+      3. questions/<difficulty>.jpg
+      4. questions/question.png
+      5. questions/question.jpg
 
     Raises FileNotFoundError with a helpful message if nothing is found.
     """
@@ -110,9 +116,25 @@ def _resolve_question_image(difficulty: str) -> Path:
         raise FileNotFoundError(
             f"The questions/ folder does not exist.\n"
             f"Expected it at: {QUESTIONS_DIR.resolve()}\n"
-            f"Create the folder and drop your question image inside it."
+            f"Create the folder and drop your question images inside it "
+            f"(e.g. 1.png, 2.png, 3.png)."
         )
 
+    # ── 1. Prefer numbered images picked at random ─────────────────────────────
+    numbered = sorted(
+        [
+            p for p in QUESTIONS_DIR.iterdir()
+            if p.suffix.lower() in {".png", ".jpg"} and p.stem.isdigit()
+        ],
+        key=lambda p: int(p.stem),
+    )
+    if numbered:
+        chosen = random.choice(numbered)
+        print_step("🎲", f"Randomly selected question image: {chosen.name} "
+                         f"(pool: {[p.name for p in numbered]})")
+        return chosen
+
+    # ── 2. Fall back to named/generic images ──────────────────────────────────
     candidates = [
         QUESTIONS_DIR / f"{difficulty}.png",
         QUESTIONS_DIR / f"{difficulty}.jpg",
@@ -127,7 +149,8 @@ def _resolve_question_image(difficulty: str) -> Path:
     raise FileNotFoundError(
         f"No question image found for difficulty '{difficulty}'.\n"
         f"Looked in : {QUESTIONS_DIR.resolve()}\n"
-        f"Tried     : {[p.name for p in candidates]}\n"
+        f"Tried     : numbered files (1.png/jpg …), "
+        f"{[p.name for p in candidates]}\n"
         f"Found     : {found or ['(empty folder)']}"
     )
 

@@ -17,7 +17,10 @@ build_question_scene   – question PNG scaled to 9:16, slides in from the right
                          on top of a frozen difficulty background.
                          A random comment audio from comments/ is attached and
                          transcribed; its words are rendered as word-by-word
-                         subtitles in the same style as the intro.
+                         subtitles in the same Inter-Black style as the intro.
+                         Comment audio and subtitles are delayed by
+                         COMMENT_DELAY seconds after the difficulty image
+                         appears, giving the slide-in animation breathing room.
                          The timer SFX is ducked while the comment plays,
                          then restored to full volume once it finishes.
                          An animated countdown clock is composited in the
@@ -25,9 +28,9 @@ build_question_scene   – question PNG scaled to 9:16, slides in from the right
 build_review_scene     – question_review/question_review.mp4 looped to match a
                          randomly-picked transition audio (transition/N.mp3).
                          The audio is transcribed and rendered as word-by-word
-                         subtitles pinned to the upper quarter of the frame
-                         (upper half of the upper half, vertically centred in
-                         that zone).
+                         subtitles dead-centre horizontally, pinned to the
+                         upper section of the upper half of the frame
+                         (i.e. the top quarter, vertically centred within it).
 """
 
 import math
@@ -67,6 +70,11 @@ _TIMER_DUCK_VOLUME = 0.15
 # Countdown clock appearance
 _CLOCK_SIZE   = 210    # diameter in pixels
 _CLOCK_MARGIN = 40     # gap from the frame edge (bottom-right corner)
+
+# How many seconds to wait after the difficulty image appears before the
+# comment audio (and its subtitles) begin playing.  This gives the
+# question slide-in animation room to breathe before the voice kicks in.
+COMMENT_DELAY = 2.0    # seconds
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
@@ -155,25 +163,19 @@ def build_question_scene(
     Load a question image and animate it sliding in from the right edge,
     composited on top of a frozen still from the difficulty scene.
 
-    A random comment audio is picked from `comments_dir`, played over the
-    scene, and transcribed so its words appear as word-by-word subtitles in
-    the same Inter-Black style used throughout the project.
+    Comment audio and its word-by-word subtitles are delayed by COMMENT_DELAY
+    seconds (default 2 s) so the slide-in animation fully settles before the
+    voice begins.  The timer SFX is ducked only during the window where the
+    comment overlaps it.
 
-    During comment playback the timer SFX is ducked to _TIMER_DUCK_VOLUME so
-    the voice stays intelligible; once the comment ends the timer returns to
-    full volume for the remainder of the scene.
-
-    An animated countdown clock (green → amber → red sweeping arc) is
-    composited in the bottom-right corner.  It counts down from `duration`
-    seconds and disappears when the scene ends.
-
-    Audio layers (all mixed via CompositeAudioClip)
-    -----------------------------------------------
-    [silence bed]  0 ──────────────────────────────────── duration
-    [woosh]        0 ── slide_duration
-    [timer ducked] slide_duration ── slide_duration + comment_hold  (15 % vol)
-    [timer normal]                   slide_duration + comment_hold ── duration
-    [comment]      0 ── comment.duration
+    Audio layers timeline
+    ─────────────────────
+    scene time:  0 ────────────────────────────────────────────────── duration
+    woosh:       0 ── slide_duration
+    timer:             slide_duration ─────────────────────────────── duration
+      ducked:                          COMMENT_DELAY ──────────────── COMMENT_DELAY + comment.dur
+      normal:          slide_duration ─ COMMENT_DELAY   and   COMMENT_DELAY+comment.dur ─ duration
+    comment:                           COMMENT_DELAY ──── COMMENT_DELAY + comment.dur
 
     Args:
         image_path:     Path to the PNG/JPG inside the questions/ folder.
@@ -217,26 +219,25 @@ def build_question_scene(
 
     # ── 5. Build word-by-word subtitle clips for the comment ──────────────────
     #
-    #   build_subtitle_clips() expects word timestamps relative to t=0 of the
-    #   clip being composited — which is t=0 of the question scene — so the
-    #   raw transcription timestamps map directly without any offset.
-    print_step("📝", "Rendering comment subtitles...")
-    comment_subtitle_clips = build_subtitle_clips(comment_words)
-    print(f"   Subtitle clips : {len(comment_subtitle_clips)} word(s)")
+    #   Whisper timestamps are relative to the start of the audio file (t=0).
+    #   Because the comment audio is delayed by COMMENT_DELAY seconds in scene
+    #   time, we shift every word's start/end by the same amount so the
+    #   subtitle appears in sync with the voice.
+    print_step("📝", "Rendering comment subtitles (delayed by "
+                     f"{COMMENT_DELAY:.1f} s)...")
+    delayed_comment_words = [
+        {**w, "start": w["start"] + COMMENT_DELAY, "end": w["end"] + COMMENT_DELAY}
+        for w in comment_words
+    ]
+    comment_subtitle_clips = build_subtitle_clips(delayed_comment_words)
+    print(f"   Subtitle clips : {len(comment_subtitle_clips)} word(s)  "
+          f"(shifted +{COMMENT_DELAY:.1f} s)")
 
     # ── 6. Build animated countdown clock ─────────────────────────────────────
     print_step("⏰", "Building countdown clock...")
     clock_clip = build_countdown_clip(duration=duration, size=CLOCK_SIZE, fps=fps)
 
-    # Position: horizontally centered, vertically centered in the top quarter.
-    #
-    #   Full frame    : 0 ──────────────────────────── OUT_H
-    #   Top half      : 0 ──────────── OUT_H / 2
-    #   Top quarter   : 0 ── OUT_H / 4
-    #   Zone centre   : OUT_H / 8
-    #   Clock top edge: zone_centre - CLOCK_SIZE // 2
     clock_x = (OUT_W - CLOCK_SIZE) // 2
-    # clock_y = OUT_H // 8 - CLOCK_SIZE // 2
     clock_y = OUT_H // 8 - CLOCK_SIZE // 2 + 40
     clock_clip = clock_clip.with_position((clock_x, clock_y))
     print(f"   Clock position : ({clock_x}, {clock_y})  "
@@ -250,24 +251,24 @@ def build_question_scene(
 
     # ── 8. Build audio ─────────────────────────────────────────────────────────
     #
-    #   The timer SFX starts at `slide_duration` (scene time) and loops until
-    #   the end.  While the comment audio is playing we split it into two
-    #   segments and duck the first one.
+    #   Timer runs from slide_duration → duration in scene time.
+    #   Comment runs from COMMENT_DELAY → COMMENT_DELAY + comment.duration.
     #
-    #   comment_hold: how far into the timer's own timeline the comment
-    #                 overlaps (timer starts at slide_duration in scene time;
-    #                 comment starts at t=0 in scene time).
+    #   Ducked window in scene time:
+    #     duck_start_scene = max(slide_duration, COMMENT_DELAY)
+    #     duck_end_scene   = min(COMMENT_DELAY + comment.duration, duration)
     #
-    #       scene time:  0 ────── slide_duration ─────────────────────── duration
-    #       comment:     |── comment.duration ──|
-    #       timer:                |── ducked ───|─── normal ───────────|
+    #   Converted to the timer array's own timeline (offset by slide_duration):
+    #     duck_start_timer = duck_start_scene - slide_duration
+    #     duck_end_timer   = duck_end_scene   - slide_duration
 
-    hold_duration = duration - slide_duration
+    hold_duration = duration - slide_duration          # timer array length
 
-    # How many seconds of the TIMER (starting at slide_duration) are covered
-    # by the comment audio.
-    comment_hold = max(0.0, min(comment_audio.duration - slide_duration,
-                                hold_duration))
+    duck_start_scene = max(slide_duration, COMMENT_DELAY)
+    duck_end_scene   = min(COMMENT_DELAY + comment_audio.duration, duration)
+    duck_start_timer = max(0.0, duck_start_scene - slide_duration)
+    duck_end_timer   = max(0.0, duck_end_scene   - slide_duration)
+    comment_hold     = duck_end_timer - duck_start_timer   # seconds of ducking
 
     # Silent bed — full scene length
     n_samples   = int(duration * AUDIO_FPS)
@@ -291,16 +292,6 @@ def build_question_scene(
         print(f"   ⚠️  Woosh SFX not found at {woosh_path} — skipping.")
 
     # ── Timer SFX with comment-aware ducking ───────────────────────────────────
-    #
-    #   concatenate_audioclips() returns a CompositeAudioClip which has no
-    #   multiply_volume method.  Instead we bake the looped timer into a raw
-    #   numpy array and apply the volume envelope with plain multiplication —
-    #   no clip-level volume API required.
-    #
-    #       timer array index 0  →  scene time slide_duration
-    #       samples [0 : duck_end_sample]  →  _TIMER_DUCK_VOLUME
-    #       samples [duck_end_sample : ]   →  1.0  (unchanged)
-    #
     timer_path = SFX_DIR / "timer.mp3"
     if timer_path.exists():
         print_step("⏱ ", f"Loading timer SFX → {timer_path.name}")
@@ -314,30 +305,33 @@ def build_question_scene(
         timer_arr = timer_looped.to_soundarray(fps=AUDIO_FPS).astype(np.float32)
 
         if comment_hold > 0:
-            duck_end_sample = min(int(comment_hold * AUDIO_FPS), len(timer_arr))
-            timer_arr[:duck_end_sample] *= _TIMER_DUCK_VOLUME
+            duck_start_sample = int(duck_start_timer * AUDIO_FPS)
+            duck_end_sample   = min(int(duck_end_timer * AUDIO_FPS), len(timer_arr))
+            timer_arr[duck_start_sample:duck_end_sample] *= _TIMER_DUCK_VOLUME
             print(f"   Timer ducked   : {comment_hold:.2f} s  "
-                  f"({int(_TIMER_DUCK_VOLUME * 100)}% vol)  "
-                  f"→ full volume for remaining "
-                  f"{hold_duration - comment_hold:.2f} s")
+                  f"(timer t={duck_start_timer:.2f}–{duck_end_timer:.2f} s, "
+                  f"{int(_TIMER_DUCK_VOLUME * 100)}% vol)")
+            print(f"   Timer normal   : before t={duck_start_timer:.2f} s and "
+                  f"after t={duck_end_timer:.2f} s in timer timeline")
         else:
             print(f"   Timer normal   : {hold_duration:.2f} s  "
-                  f"(comment ends before timer begins — no ducking)")
+                  f"(comment does not overlap timer — no ducking)")
 
         timer_final = AudioArrayClip(timer_arr, fps=AUDIO_FPS)
         audio_layers.append(timer_final.with_start(slide_duration))
     else:
         print(f"   ⚠️  Timer SFX not found at {timer_path} — skipping.")
 
-    # ── Comment audio layer ────────────────────────────────────────────────────
-    # Clamp to scene duration so it never extends the clip unintentionally.
+    # ── Comment audio layer (delayed by COMMENT_DELAY) ────────────────────────
+    max_comment_dur = max(0.0, duration - COMMENT_DELAY)
     comment_clamped = (
-        comment_audio.subclipped(0, min(comment_audio.duration, duration))
-        .with_start(0)
+        comment_audio.subclipped(0, min(comment_audio.duration, max_comment_dur))
+        .with_start(COMMENT_DELAY)
     )
     audio_layers.append(comment_clamped)
     print(f"   Comment audio  : {comment_clamped.duration:.2f} s  "
-          f"starting at t=0 s")
+          f"starting at t={COMMENT_DELAY:.1f} s  "
+          f"(delayed {COMMENT_DELAY:.1f} s)")
 
     scene_audio = CompositeAudioClip(audio_layers).with_duration(duration)
     print(f"   Scene audio    : {len(audio_layers)} layer(s) mixed over "
@@ -359,20 +353,18 @@ def build_review_scene(
     audio file from `transitions_dir` (files named 1.mp3 … 55.mp3).
 
     The transition audio is transcribed with Whisper and rendered as
-    word-by-word subtitles pinned to the *upper quarter* of the frame
-    (the upper half of the upper half, vertically).  Horizontally the
-    subtitles remain centred, matching the style used everywhere else.
+    word-by-word subtitles dead-centre horizontally, pinned to the upper
+    section of the upper half of the frame.
 
-    Subtitle vertical zone
-    ──────────────────────
-      Full frame   : 0 ──────────────────────────── OUT_H
-      Upper half   : 0 ──────────── OUT_H / 2
-      Upper quarter: 0 ── OUT_H / 4   ← subtitle zone
-      Zone centre  : OUT_H / 8
+    Subtitle vertical positioning
+    ─────────────────────────────
+      Full frame    : 0 ──────────────────────────── OUT_H
+      Upper half    : 0 ──────────── OUT_H / 2
+      Upper section : 0 ── OUT_H / 4   ← subtitle lives here
+      Zone centre   : OUT_H / 8
 
-    Each subtitle clip returned by build_subtitle_clips() is repositioned
-    to ('center', OUT_H // 8) so it stays in the top quarter regardless
-    of the default position baked into the subtitle builder.
+    Each subtitle clip is positioned at ('center', OUT_H // 8) so it is
+    horizontally centred and sits in the upper section of the upper half.
 
     Args:
         review_video_path : Path to question_review/question_review.mp4.
@@ -414,30 +406,34 @@ def build_review_scene(
     looped_silent = loop_clip_to(reframed.without_audio(), scene_duration)
     print(f"   Video looped to: {looped_silent.duration:.2f} s")
 
-    # ── 3. Build word-by-word subtitle clips, pinned to upper quarter ──────────
+    # ── 3. Build word-by-word subtitle clips, pinned to upper section ──────────
     #
-    #   build_subtitle_clips() returns clips with whatever default position the
-    #   subtitle builder uses.  We override each clip's position here so that
-    #   all words land in the upper quarter of the 9:16 frame:
+    #   Subtitle vertical zone
+    #   ──────────────────────
+    #   Full frame    : 0 ─────────────────────── OUT_H
+    #   Upper half    : 0 ──────── OUT_H / 2
+    #   Upper section : 0 ── OUT_H / 4
+    #   Zone centre   : OUT_H / 8
     #
-    #       subtitle_y  = vertical centre of the upper-quarter zone
-    #                   = OUT_H // 8
-    #
-    #   Using ('center', subtitle_y) keeps the horizontal axis centred while
-    #   pinning the clip's *top edge* at subtitle_y.  If you want the clip's
-    #   vertical centre at OUT_H // 8 instead, subtract half the clip height —
-    #   but since text-clip heights vary per word, ('center', OUT_H // 8) is
-    #   the safest, most consistent anchor.
-    print_step("📝", "Rendering word-by-word subtitles (upper quarter)...")
+    #   ('center', OUT_H // 8) → horizontally centred, top edge of the
+    #   subtitle text anchored at the zone centre.  Since the zone is only
+    #   OUT_H/4 tall this keeps every word comfortably within the upper
+    #   section of the upper half regardless of per-word clip height.
+    print_step("📝", "Rendering word-by-word subtitles (upper section, centred)...")
     raw_subtitle_clips = build_subtitle_clips(words)
 
-    subtitle_y = OUT_H // 8          # vertical centre of the upper-quarter zone
+    # Vertical centre of the upper section of the upper half:
+    #   upper half   = 0 → OUT_H / 2
+    #   upper section = 0 → OUT_H / 4
+    #   zone centre  = OUT_H / 8
+    subtitle_y = OUT_H // 8
     subtitle_clips = [
         clip.with_position(("center", subtitle_y))
         for clip in raw_subtitle_clips
     ]
     print(f"   Subtitle clips : {len(subtitle_clips)} word(s)  "
-          f"pinned to y={subtitle_y} (upper quarter, frame height={OUT_H})")
+          f"→ ('center', {subtitle_y})  "
+          f"[upper section of upper half, frame={OUT_W}×{OUT_H}]")
 
     # ── 4. Composite: looped video + repositioned subtitles ───────────────────
     print_step("🎞", "Compositing review scene layers...")

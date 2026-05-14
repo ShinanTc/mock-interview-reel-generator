@@ -3,3 +3,4 @@ output
 .git
 __pycache__
 questions/*
+*.srt
