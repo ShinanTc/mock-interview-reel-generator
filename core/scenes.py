@@ -22,6 +22,12 @@ build_question_scene   – question PNG scaled to 9:16, slides in from the right
                          then restored to full volume once it finishes.
                          An animated countdown clock is composited in the
                          bottom-right corner for the full question duration.
+build_review_scene     – question_review/question_review.mp4 looped to match a
+                         randomly-picked transition audio (transition/N.mp3).
+                         The audio is transcribed and rendered as word-by-word
+                         subtitles pinned to the upper quarter of the frame
+                         (upper half of the upper half, vertically centred in
+                         that zone).
 """
 
 import math
@@ -338,6 +344,109 @@ def build_question_scene(
           f"{duration:.2f} s")
 
     return video, scene_audio
+
+
+def build_review_scene(
+    review_video_path: Path,
+    transitions_dir: Path,
+    fps: int = 30,
+) -> tuple:
+    """
+    Build the question-review scene.
+
+    The review video (`question_review/question_review.mp4`) is reframed to
+    9:16 and looped to match the duration of a randomly chosen transition
+    audio file from `transitions_dir` (files named 1.mp3 … 55.mp3).
+
+    The transition audio is transcribed with Whisper and rendered as
+    word-by-word subtitles pinned to the *upper quarter* of the frame
+    (the upper half of the upper half, vertically).  Horizontally the
+    subtitles remain centred, matching the style used everywhere else.
+
+    Subtitle vertical zone
+    ──────────────────────
+      Full frame   : 0 ──────────────────────────── OUT_H
+      Upper half   : 0 ──────────── OUT_H / 2
+      Upper quarter: 0 ── OUT_H / 4   ← subtitle zone
+      Zone centre  : OUT_H / 8
+
+    Each subtitle clip returned by build_subtitle_clips() is repositioned
+    to ('center', OUT_H // 8) so it stays in the top quarter regardless
+    of the default position baked into the subtitle builder.
+
+    Args:
+        review_video_path : Path to question_review/question_review.mp4.
+        transitions_dir   : Folder holding transition audio files
+                            (1.mp3 … 55.mp3).
+        fps               : Frame rate — should match OUTPUT_FPS from config.
+
+    Returns:
+        (silent_composite_clip, audio_clip)
+    """
+    # ── 1. Pick & transcribe a random transition audio ─────────────────────────
+    print_step("🎵", "Picking random transition audio...")
+    audio_path = pick_random_file(transitions_dir, [".mp3", ".wav", ".m4a", ".aac"])
+    print(f"   Transition file: {audio_path.name}")
+
+    print_step("🎙", "Transcribing transition audio for subtitles...")
+    words = transcribe_words(audio_path)
+    print(f"   Words found    : {len(words)}")
+
+    audio_clip = AudioFileClip(str(audio_path))
+    scene_duration = audio_clip.duration
+    print(f"   Audio duration : {scene_duration:.2f} s")
+
+    # ── 2. Load the review video, reframe to 9:16, loop to audio length ────────
+    print_step("📹", f"Loading review video → {review_video_path.name}")
+    if not review_video_path.exists():
+        raise FileNotFoundError(
+            f"Review video not found.\n"
+            f"Expected : {review_video_path.resolve()}\n"
+            f"Create the file or check the path in pipeline.py."
+        )
+
+    raw_video = VideoFileClip(str(review_video_path))
+    print(f"   Original size  : {raw_video.w}×{raw_video.h}")
+
+    reframed = force_9_16(raw_video)
+    print(f"   After 9:16 crop: {reframed.w}×{reframed.h}")
+
+    looped_silent = loop_clip_to(reframed.without_audio(), scene_duration)
+    print(f"   Video looped to: {looped_silent.duration:.2f} s")
+
+    # ── 3. Build word-by-word subtitle clips, pinned to upper quarter ──────────
+    #
+    #   build_subtitle_clips() returns clips with whatever default position the
+    #   subtitle builder uses.  We override each clip's position here so that
+    #   all words land in the upper quarter of the 9:16 frame:
+    #
+    #       subtitle_y  = vertical centre of the upper-quarter zone
+    #                   = OUT_H // 8
+    #
+    #   Using ('center', subtitle_y) keeps the horizontal axis centred while
+    #   pinning the clip's *top edge* at subtitle_y.  If you want the clip's
+    #   vertical centre at OUT_H // 8 instead, subtract half the clip height —
+    #   but since text-clip heights vary per word, ('center', OUT_H // 8) is
+    #   the safest, most consistent anchor.
+    print_step("📝", "Rendering word-by-word subtitles (upper quarter)...")
+    raw_subtitle_clips = build_subtitle_clips(words)
+
+    subtitle_y = OUT_H // 8          # vertical centre of the upper-quarter zone
+    subtitle_clips = [
+        clip.with_position(("center", subtitle_y))
+        for clip in raw_subtitle_clips
+    ]
+    print(f"   Subtitle clips : {len(subtitle_clips)} word(s)  "
+          f"pinned to y={subtitle_y} (upper quarter, frame height={OUT_H})")
+
+    # ── 4. Composite: looped video + repositioned subtitles ───────────────────
+    print_step("🎞", "Compositing review scene layers...")
+    review_silent = CompositeVideoClip(
+        [looped_silent, *subtitle_clips],
+        size=(OUT_W, OUT_H),
+    ).with_duration(scene_duration).with_fps(fps)
+
+    return review_silent, audio_clip
 
 
 # ── Private helpers ────────────────────────────────────────────────────────────

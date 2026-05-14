@@ -8,8 +8,10 @@ Orchestrates the full reel-generation pipeline.
         2. Build difficulty scene   (PNG + riser SFX)
         3. Build question scene     (PNG slide-in on top of difficulty +
                                      random comment audio + comment subtitles)
-        4. Stitch all three scenes  intro → difficulty → question
-        5. Export to output/reel_<difficulty>.mp4
+        4. Build review scene       (question_review.mp4 looped to a random
+                                     transition audio + upper-quarter subtitles)
+        5. Stitch all four scenes   intro → difficulty → question → review
+        6. Export to output/reel_<difficulty>.mp4
 """
 
 import os
@@ -18,7 +20,12 @@ from pathlib import Path
 from moviepy import concatenate_audioclips, concatenate_videoclips
 
 from config import OUTPUT_DIR, OUTPUT_FPS, OUTPUT_CODEC, OUTPUT_PRESET
-from core.scenes import build_intro_scene, build_difficulty_scene, build_question_scene
+from core.scenes import (
+    build_intro_scene,
+    build_difficulty_scene,
+    build_question_scene,
+    build_review_scene,
+)
 from utils import print_step
 
 # Folder that holds the question images (one per difficulty, or a single image).
@@ -26,6 +33,13 @@ QUESTIONS_DIR = Path(__file__).parent / "questions"
 
 # Folder that holds comment audio files (1.mp3, 2.mp3, …).
 COMMENTS_DIR = Path(__file__).parent / "comments"
+
+# The fixed review video shown after the question timer expires.
+REVIEW_VIDEO_PATH = Path(__file__).parent / "question_review" / "question_review.mp4"
+
+# Folder that holds the transition audio files used in the review scene
+# (1.mp3, 2.mp3, … 55.mp3).
+TRANSITIONS_DIR = Path(__file__).parent / "transition"
 
 
 def run(difficulty: str) -> None:
@@ -49,19 +63,32 @@ def run(difficulty: str) -> None:
         image_path=question_image,
         bg_clip=diff_silent,
         fps=OUTPUT_FPS,
-        comments_dir=COMMENTS_DIR,   # ← new: random comment audio + subtitles
+        comments_dir=COMMENTS_DIR,
     )
 
-    # ── 4. Stitch ─────────────────────────────────────────────────────────────
-    print_step("🔗", "Stitching scenes  [ intro → difficulty → question ] ...")
+    # ── 4. Review ─────────────────────────────────────────────────────────────
+    #   question_review.mp4 looped to the duration of a random transition audio.
+    #   Word-by-word subtitles from the transcription are pinned to the upper
+    #   quarter of the 9:16 frame.
+    print_step("🔍", "=== REVIEW SCENE ===")
+    _check_transitions_dir()
+    review_silent, review_audio = build_review_scene(
+        review_video_path=REVIEW_VIDEO_PATH,
+        transitions_dir=TRANSITIONS_DIR,
+        fps=OUTPUT_FPS,
+    )
+
+    # ── 5. Stitch ─────────────────────────────────────────────────────────────
+    print_step("🔗", "Stitching scenes  [ intro → difficulty → question → review ] ...")
     final = _stitch(
-        intro_silent, intro_audio,
-        diff_silent,  diff_audio,
-        q_silent,     q_audio,
+        intro_silent,   intro_audio,
+        diff_silent,    diff_audio,
+        q_silent,       q_audio,
+        review_silent,  review_audio,
     )
     print(f"   Total duration : {final.duration:.2f} s")
 
-    # ── 5. Export ─────────────────────────────────────────────────────────────
+    # ── 6. Export ─────────────────────────────────────────────────────────────
     _export(final, difficulty)
 
 
@@ -105,10 +132,41 @@ def _resolve_question_image(difficulty: str) -> Path:
     )
 
 
+def _check_transitions_dir() -> None:
+    """
+    Raise a descriptive FileNotFoundError if the transitions/ folder is
+    missing or contains no audio files, so the user gets a clear message
+    rather than a bare exception from pick_random_file().
+    """
+    if not TRANSITIONS_DIR.exists():
+        raise FileNotFoundError(
+            f"The transitions/ folder does not exist.\n"
+            f"Expected it at: {TRANSITIONS_DIR.resolve()}\n"
+            f"Create the folder and drop your numbered mp3 files inside "
+            f"(1.mp3, 2.mp3, … 55.mp3)."
+        )
+
+    audio_extensions = {".mp3", ".wav", ".m4a", ".aac"}
+    audio_files = [
+        p for p in TRANSITIONS_DIR.iterdir()
+        if p.suffix.lower() in audio_extensions
+    ]
+    
+    if not audio_files:
+        raise FileNotFoundError(
+            f"No audio files found in {TRANSITIONS_DIR.resolve()}.\n"
+            f"Add numbered mp3 files (1.mp3 … 55.mp3) to that folder."
+        )
+
+    print(f"   Transitions dir: {TRANSITIONS_DIR.resolve()}  "
+          f"({len(audio_files)} audio file(s) available)")
+
+
 def _stitch(
-    intro_silent, intro_audio,
-    diff_silent,  diff_audio,
-    q_silent,     q_audio,
+    intro_silent,   intro_audio,
+    diff_silent,    diff_audio,
+    q_silent,       q_audio,
+    review_silent,  review_audio,
 ):
     """
     Concatenate video and audio tracks independently before recombining.
@@ -116,13 +174,15 @@ def _stitch(
     MoviePy 2.x does not reliably carry audio through CompositeVideoClip /
     ImageClip chains, so tracks are joined separately then merged.
 
-    Scene order:  intro  →  difficulty  →  question
+    Scene order:  intro  →  difficulty  →  question  →  review
     """
     final_video = concatenate_videoclips(
-        [intro_silent, diff_silent, q_silent],
+        [intro_silent, diff_silent, q_silent, review_silent],
         method="compose",
     )
-    final_audio = concatenate_audioclips([intro_audio, diff_audio, q_audio])
+    final_audio = concatenate_audioclips(
+        [intro_audio, diff_audio, q_audio, review_audio]
+    )
     return final_video.with_audio(final_audio)
 
 
