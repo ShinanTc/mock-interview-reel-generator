@@ -20,6 +20,8 @@ build_question_scene   – question PNG scaled to 9:16, slides in from the right
                          subtitles in the same style as the intro.
                          The timer SFX is ducked while the comment plays,
                          then restored to full volume once it finishes.
+                         An animated countdown clock is composited in the
+                         bottom-right corner for the full question duration.
 """
 
 import math
@@ -45,6 +47,7 @@ from config import (
     SFX_DIR,
     VIDEOS_DIR,
 )
+from core.clock import build_countdown_clip
 from core.transcribe import transcribe_words
 from core.subtitles import build_subtitle_clips
 from core.video import force_9_16, image_cover_crop, loop_clip_to
@@ -54,6 +57,10 @@ from utils import pick_random_file, print_step
 # Volume multiplier applied to the timer SFX while the comment audio is
 # playing.  0.15 = 15 % of original volume — audible but not distracting.
 _TIMER_DUCK_VOLUME = 0.15
+
+# Countdown clock appearance
+_CLOCK_SIZE   = 210    # diameter in pixels
+_CLOCK_MARGIN = 40     # gap from the frame edge (bottom-right corner)
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
@@ -150,6 +157,10 @@ def build_question_scene(
     the voice stays intelligible; once the comment ends the timer returns to
     full volume for the remainder of the scene.
 
+    An animated countdown clock (green → amber → red sweeping arc) is
+    composited in the bottom-right corner.  It counts down from `duration`
+    seconds and disappears when the scene ends.
+
     Audio layers (all mixed via CompositeAudioClip)
     -----------------------------------------------
     [silence bed]  0 ──────────────────────────────────── duration
@@ -172,7 +183,9 @@ def build_question_scene(
     Returns:
         (video_clip, audio_clip)
     """
-    AUDIO_FPS = 44_100
+    AUDIO_FPS    = 44_100
+    CLOCK_SIZE   = _CLOCK_SIZE
+    CLOCK_MARGIN = _CLOCK_MARGIN
 
     # ── 1. Freeze last frame of the difficulty clip as the background ──────────
     last_frame_t = max(0.0, bg_clip.duration - 1 / fps)
@@ -205,13 +218,31 @@ def build_question_scene(
     comment_subtitle_clips = build_subtitle_clips(comment_words)
     print(f"   Subtitle clips : {len(comment_subtitle_clips)} word(s)")
 
-    # ── 6. Composite: frozen bg → animated question → comment subtitles ───────
+    # ── 6. Build animated countdown clock ─────────────────────────────────────
+    print_step("⏰", "Building countdown clock...")
+    clock_clip = build_countdown_clip(duration=duration, size=CLOCK_SIZE, fps=fps)
+
+    # Position: horizontally centered, vertically centered in the top quarter.
+    #
+    #   Full frame    : 0 ──────────────────────────── OUT_H
+    #   Top half      : 0 ──────────── OUT_H / 2
+    #   Top quarter   : 0 ── OUT_H / 4
+    #   Zone centre   : OUT_H / 8
+    #   Clock top edge: zone_centre - CLOCK_SIZE // 2
+    clock_x = (OUT_W - CLOCK_SIZE) // 2
+    # clock_y = OUT_H // 8 - CLOCK_SIZE // 2
+    clock_y = OUT_H // 8 - CLOCK_SIZE // 2 + 40
+    clock_clip = clock_clip.with_position((clock_x, clock_y))
+    print(f"   Clock position : ({clock_x}, {clock_y})  "
+          f"[top-quarter centre, horizontally centred in {OUT_W}x{OUT_H} frame]")
+
+    # ── 7. Composite: frozen bg → animated question → clock → subtitles ───────
     video = CompositeVideoClip(
-        [bg, animated, *comment_subtitle_clips],
+        [bg, animated, clock_clip, *comment_subtitle_clips],
         size=(OUT_W, OUT_H),
     ).with_fps(fps)
 
-    # ── 7. Build audio ─────────────────────────────────────────────────────────
+    # ── 8. Build audio ─────────────────────────────────────────────────────────
     #
     #   The timer SFX starts at `slide_duration` (scene time) and loops until
     #   the end.  While the comment audio is playing we split it into two
