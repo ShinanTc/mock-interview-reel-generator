@@ -6,7 +6,8 @@ Orchestrates the full reel-generation pipeline.
     run(difficulty)
         1. Build intro scene        (video + audio + subtitles)
         2. Build difficulty scene   (PNG + riser SFX)
-        3. Build question scene     (PNG slide-in on top of difficulty + silence)
+        3. Build question scene     (PNG slide-in on top of difficulty +
+                                     random comment audio + comment subtitles)
         4. Stitch all three scenes  intro → difficulty → question
         5. Export to output/reel_<difficulty>.mp4
 """
@@ -22,6 +23,9 @@ from utils import print_step
 
 # Folder that holds the question images (one per difficulty, or a single image).
 QUESTIONS_DIR = Path(__file__).parent / "questions"
+
+# Folder that holds comment audio files (1.mp3, 2.mp3, …).
+COMMENTS_DIR = Path(__file__).parent / "comments"
 
 
 def run(difficulty: str) -> None:
@@ -45,6 +49,7 @@ def run(difficulty: str) -> None:
         image_path=question_image,
         bg_clip=diff_silent,
         fps=OUTPUT_FPS,
+        comments_dir=COMMENTS_DIR,   # ← new: random comment audio + subtitles
     )
 
     # ── 4. Stitch ─────────────────────────────────────────────────────────────

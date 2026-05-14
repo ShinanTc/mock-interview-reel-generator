@@ -14,9 +14,12 @@ build_intro_scene      – random video + random audio + word-synced subtitles
 build_difficulty_scene – difficulty PNG held for ≤ DIFFICULTY_DURATION seconds
                          over sfx/riser.mp3
 build_question_scene   – question PNG scaled to 9:16, slides in from the right
-                         on top of a frozen difficulty background, with a woosh
-                         SFX synced to the slide animation and a looped timer
-                         SFX playing during the hold window
+                         on top of a frozen difficulty background.
+                         A random comment audio from comments/ is attached and
+                         transcribed; its words are rendered as word-by-word
+                         subtitles in the same style as the intro.
+                         The timer SFX is ducked while the comment plays,
+                         then restored to full volume once it finishes.
 """
 
 import math
@@ -46,6 +49,11 @@ from core.transcribe import transcribe_words
 from core.subtitles import build_subtitle_clips
 from core.video import force_9_16, image_cover_crop, loop_clip_to
 from utils import pick_random_file, print_step
+
+
+# Volume multiplier applied to the timer SFX while the comment audio is
+# playing.  0.15 = 15 % of original volume — audible but not distracting.
+_TIMER_DUCK_VOLUME = 0.15
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
@@ -125,6 +133,7 @@ def build_difficulty_scene(difficulty: str) -> tuple[CompositeVideoClip, AudioFi
 def build_question_scene(
     image_path: Path,
     bg_clip: CompositeVideoClip,
+    comments_dir: Path,
     duration: float = 10,
     slide_duration: float = 0.45,
     fps: int = 30,
@@ -133,32 +142,35 @@ def build_question_scene(
     Load a question image and animate it sliding in from the right edge,
     composited on top of a frozen still from the difficulty scene.
 
-    The question image is scaled to fill the full 9:16 frame (OUT_W × OUT_H)
-    so there are no empty bars or black borders around it.
+    A random comment audio is picked from `comments_dir`, played over the
+    scene, and transcribed so its words appear as word-by-word subtitles in
+    the same Inter-Black style used throughout the project.
 
-    The slide animation starts fully off-screen (x = +OUT_W) and eases into
-    its resting position (x = 0) over `slide_duration` seconds, then holds
-    still for the remainder of `duration`.
+    During comment playback the timer SFX is ducked to _TIMER_DUCK_VOLUME so
+    the voice stays intelligible; once the comment ends the timer returns to
+    full volume for the remainder of the scene.
 
-    Audio layers
-    ------------
-    - Silence bed  : full scene length — keeps all clips at a consistent size.
-    - Woosh SFX    : plays at t=0, synced to the slide-in animation.
-    - Timer SFX    : loops from t=slide_duration to t=duration, filling the
-                     window where the question sits still on screen.
+    Audio layers (all mixed via CompositeAudioClip)
+    -----------------------------------------------
+    [silence bed]  0 ──────────────────────────────────── duration
+    [woosh]        0 ── slide_duration
+    [timer ducked] slide_duration ── slide_duration + comment_hold  (15 % vol)
+    [timer normal]                   slide_duration + comment_hold ── duration
+    [comment]      0 ── comment.duration
 
     Args:
         image_path:     Path to the PNG/JPG inside the questions/ folder.
         bg_clip:        The difficulty clip — its last frame is frozen and used
                         as the background so the question feels like it slides
                         in ON TOP of the difficulty image.
+        comments_dir:   Folder containing numbered comment mp3 files
+                        (e.g. comments/1.mp3, comments/2.mp3 …).
         duration:       Total display time of the question slide (seconds).
         slide_duration: How long the slide-in animation takes (seconds).
         fps:            Frame rate — should match OUTPUT_FPS from config.
 
     Returns:
-        (video_clip, audio_clip) — audio contains woosh + looped timer mixed
-        over a silent bed.
+        (video_clip, audio_clip)
     """
     AUDIO_FPS = 44_100
 
@@ -181,50 +193,77 @@ def build_question_scene(
 
     animated = img.with_position(_slide_position)
 
-    # ── 4. Composite: frozen difficulty bg + animated question on top ──────────
-    video = CompositeVideoClip([bg, animated], size=(OUT_W, OUT_H)).with_fps(fps)
+    # ── 4. Pick & transcribe comment audio ────────────────────────────────────
+    comment_audio, comment_words = _load_comment(comments_dir)
 
-    # ── 5. Build audio ─────────────────────────────────────────────────────────
+    # ── 5. Build word-by-word subtitle clips for the comment ──────────────────
     #
-    #   Layers (all mixed via CompositeAudioClip):
-    #
-    #     [silence bed]  0 ──────────────────────────────────────── duration
-    #     [woosh]        0 ── slide_duration
-    #     [timer loop]             slide_duration ─────────────── duration
-    #
-    #   The silence bed acts as a full-length container so MoviePy never has
-    #   to guess the clip length from a shorter audio source.
+    #   build_subtitle_clips() expects word timestamps relative to t=0 of the
+    #   clip being composited — which is t=0 of the question scene — so the
+    #   raw transcription timestamps map directly without any offset.
+    print_step("📝", "Rendering comment subtitles...")
+    comment_subtitle_clips = build_subtitle_clips(comment_words)
+    print(f"   Subtitle clips : {len(comment_subtitle_clips)} word(s)")
 
-    hold_duration = duration - slide_duration   # seconds the slide sits still
+    # ── 6. Composite: frozen bg → animated question → comment subtitles ───────
+    video = CompositeVideoClip(
+        [bg, animated, *comment_subtitle_clips],
+        size=(OUT_W, OUT_H),
+    ).with_fps(fps)
+
+    # ── 7. Build audio ─────────────────────────────────────────────────────────
+    #
+    #   The timer SFX starts at `slide_duration` (scene time) and loops until
+    #   the end.  While the comment audio is playing we split it into two
+    #   segments and duck the first one.
+    #
+    #   comment_hold: how far into the timer's own timeline the comment
+    #                 overlaps (timer starts at slide_duration in scene time;
+    #                 comment starts at t=0 in scene time).
+    #
+    #       scene time:  0 ────── slide_duration ─────────────────────── duration
+    #       comment:     |── comment.duration ──|
+    #       timer:                |── ducked ───|─── normal ───────────|
+
+    hold_duration = duration - slide_duration
+
+    # How many seconds of the TIMER (starting at slide_duration) are covered
+    # by the comment audio.
+    comment_hold = max(0.0, min(comment_audio.duration - slide_duration,
+                                hold_duration))
 
     # Silent bed — full scene length
     n_samples   = int(duration * AUDIO_FPS)
     silence_arr = np.zeros((n_samples, 2), dtype=np.float32)
     silence_bed = AudioArrayClip(silence_arr, fps=AUDIO_FPS)
 
-    # Start with just the silence bed; append real layers as they are found.
     audio_layers = [silence_bed]
 
-    # ── Woosh SFX (slide-in window, t=0) ──────────────────────────────────────
+    # ── Woosh SFX ─────────────────────────────────────────────────────────────
     woosh_path = SFX_DIR / "woosh.mp3"
     if woosh_path.exists():
         print_step("🔊", f"Loading woosh SFX → {woosh_path.name}")
         woosh = AudioFileClip(str(woosh_path))
         print(f"   Woosh duration : {woosh.duration:.2f} s  "
               f"(slide window: {slide_duration:.2f} s)")
-
-        # Trim if the woosh is longer than the slide animation so it doesn't
-        # bleed into the "question is just sitting there" part of the scene.
         if woosh.duration > slide_duration:
             woosh = woosh.subclipped(0, slide_duration)
             print(f"   Woosh trimmed  : to {slide_duration:.2f} s")
-
-        # Start at t=0 — perfectly in sync with the first frame of the slide.
         audio_layers.append(woosh.with_start(0))
     else:
         print(f"   ⚠️  Woosh SFX not found at {woosh_path} — skipping.")
 
-    # ── Timer SFX (looped over the hold window, t=slide_duration → end) ───────
+    # ── Timer SFX with comment-aware ducking ───────────────────────────────────
+    #
+    #   concatenate_audioclips() returns a CompositeAudioClip which has no
+    #   multiply_volume method.  Instead we bake the looped timer into a raw
+    #   numpy array and apply the volume envelope with plain multiplication —
+    #   no clip-level volume API required.
+    #
+    #       timer array index 0  →  scene time slide_duration
+    #       samples [0 : duck_end_sample]  →  _TIMER_DUCK_VOLUME
+    #       samples [duck_end_sample : ]   →  1.0  (unchanged)
+    #
     timer_path = SFX_DIR / "timer.mp3"
     if timer_path.exists():
         print_step("⏱ ", f"Loading timer SFX → {timer_path.name}")
@@ -232,15 +271,36 @@ def build_question_scene(
         print(f"   Timer duration : {timer_raw.duration:.2f} s  "
               f"(hold window: {hold_duration:.2f} s)")
 
-        # Loop until the clip fills the full hold window, then hard-trim.
         timer_looped = _loop_audio_to(timer_raw, hold_duration)
 
-        # Shift so it starts exactly when the slide animation finishes.
-        audio_layers.append(timer_looped.with_start(slide_duration))
-        print(f"   Timer looped   : {hold_duration:.2f} s  "
-              f"starting at t={slide_duration:.2f} s")
+        # Render to numpy so we can manipulate samples directly.
+        timer_arr = timer_looped.to_soundarray(fps=AUDIO_FPS).astype(np.float32)
+
+        if comment_hold > 0:
+            duck_end_sample = min(int(comment_hold * AUDIO_FPS), len(timer_arr))
+            timer_arr[:duck_end_sample] *= _TIMER_DUCK_VOLUME
+            print(f"   Timer ducked   : {comment_hold:.2f} s  "
+                  f"({int(_TIMER_DUCK_VOLUME * 100)}% vol)  "
+                  f"→ full volume for remaining "
+                  f"{hold_duration - comment_hold:.2f} s")
+        else:
+            print(f"   Timer normal   : {hold_duration:.2f} s  "
+                  f"(comment ends before timer begins — no ducking)")
+
+        timer_final = AudioArrayClip(timer_arr, fps=AUDIO_FPS)
+        audio_layers.append(timer_final.with_start(slide_duration))
     else:
         print(f"   ⚠️  Timer SFX not found at {timer_path} — skipping.")
+
+    # ── Comment audio layer ────────────────────────────────────────────────────
+    # Clamp to scene duration so it never extends the clip unintentionally.
+    comment_clamped = (
+        comment_audio.subclipped(0, min(comment_audio.duration, duration))
+        .with_start(0)
+    )
+    audio_layers.append(comment_clamped)
+    print(f"   Comment audio  : {comment_clamped.duration:.2f} s  "
+          f"starting at t=0 s")
 
     scene_audio = CompositeAudioClip(audio_layers).with_duration(duration)
     print(f"   Scene audio    : {len(audio_layers)} layer(s) mixed over "
@@ -250,6 +310,34 @@ def build_question_scene(
 
 
 # ── Private helpers ────────────────────────────────────────────────────────────
+
+
+def _load_comment(comments_dir: Path) -> tuple[AudioFileClip, list]:
+    """
+    Pick a random mp3 from `comments_dir`, transcribe it, and return
+    (AudioFileClip, words).
+
+    Raises FileNotFoundError if the folder is missing or empty.
+    """
+    if not comments_dir.exists():
+        raise FileNotFoundError(
+            f"The comments/ folder does not exist.\n"
+            f"Expected it at: {comments_dir.resolve()}\n"
+            f"Create it and drop numbered mp3 files inside (1.mp3, 2.mp3, …)."
+        )
+
+    print_step("💬", "Picking random comment audio...")
+    comment_path = pick_random_file(comments_dir, [".mp3", ".wav", ".m4a", ".aac"])
+    print(f"   Comment file   : {comment_path.name}")
+
+    print_step("🎙", "Transcribing comment audio for subtitles...")
+    words = transcribe_words(comment_path)
+    print(f"   Words found    : {len(words)}")
+
+    audio = AudioFileClip(str(comment_path))
+    print(f"   Comment length : {audio.duration:.2f} s")
+
+    return audio, words
 
 
 def _loop_audio_to(clip: AudioFileClip, target_duration: float) -> AudioFileClip:
