@@ -30,7 +30,7 @@ OUT_H = 1920
 # ── Subtitle ───────────────────────────────────────────────────────────────────
 SUBTITLE_HEX    = "#385E4F"   # brand green
 SUBTITLE_Y_FRAC = 0.72        # 0 = top, 1 = bottom
-FONT_SIZE_RATIO = 0.065       # relative to OUT_W (~70 px at 1080 wide)
+FONT_SIZE_RATIO = 0.045       # relative to OUT_W (~70 px at 1080 wide)
 
 # ── Whisper transcription ──────────────────────────────────────────────────────
 # Options: "tiny" | "base" | "small" | "medium" | "large"
