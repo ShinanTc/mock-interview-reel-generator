@@ -4,14 +4,20 @@ pipeline.py
 Orchestrates the full reel-generation pipeline.
 
     run(difficulty)
-        1. Build intro scene        (video + audio + subtitles)
-        2. Build difficulty scene   (PNG + riser SFX)
-        3. Build question scene     (PNG slide-in on top of difficulty +
-                                     random comment audio + comment subtitles)
-        4. Build review scene       (question_review.mp4 looped to a random
-                                     transition audio + upper-quarter subtitles)
-        5. Stitch all four scenes   intro → difficulty → question → review
-        6. Export to output/reel_<difficulty>.mp4
+        1.  Build intro scene         (video + audio + subtitles)
+        2.  Build difficulty scene    (PNG + riser SFX)
+        3.  Build question 1 scene    (PNG slide-in on top of difficulty +
+                                       random comment audio + comment subtitles)
+        4.  Build review 1 scene      (question_review.mp4 looped to a random
+                                       transition audio + upper-quarter subtitles)
+        5.  Build question 2 scene    (PNG slide-in, full 9:16, no comment audio)
+        6.  Build review 2 scene      (question_review.mp4 looped to a different
+                                       random transition audio + upper-quarter subtitles)
+        7.  Build question 3 scene    (PNG slide-in, full 9:16, no comment audio,
+                                       no review follows)
+        8.  Stitch all seven scenes   intro → difficulty → q1 → review1 →
+                                       q2 → review2 → q3
+        9.  Export to output/reel_<difficulty>.mp4
 """
 
 import os
@@ -43,8 +49,154 @@ REVIEW_VIDEO_PATH = Path(__file__).parent / "question_review" / "question_review
 TRANSITIONS_DIR = Path(__file__).parent / "transition"
 
 
+class QuestionImagePool:
+    """
+    Manages a pool of numbered question images (1.png, 2.png, …) so that
+    each image is picked at most once per pipeline run.
+
+    Usage
+    -----
+        pool = QuestionImagePool(QUESTIONS_DIR)
+        img1 = pool.pick()   # e.g. 3.png  — now excluded
+        img2 = pool.pick()   # e.g. 1.png  — now excluded
+        img3 = pool.pick()   # e.g. 2.png  — last one
+
+    Raises
+    ------
+    FileNotFoundError  – if the questions/ folder is missing.
+    RuntimeError       – if the pool is exhausted (all images already used).
+    """
+
+    def __init__(self, questions_dir: Path) -> None:
+        if not questions_dir.exists():
+            raise FileNotFoundError(
+                f"The questions/ folder does not exist.\n"
+                f"Expected it at: {questions_dir.resolve()}\n"
+                f"Create the folder and drop your question images inside it "
+                f"(e.g. 1.png, 2.png, 3.png)."
+            )
+
+        # Collect all numbered images and sort them.
+        self._available: list[Path] = sorted(
+            [
+                p for p in questions_dir.iterdir()
+                if p.suffix.lower() in {".png", ".jpg"} and p.stem.isdigit()
+            ],
+            key=lambda p: int(p.stem),
+        )
+
+        if not self._available:
+            raise FileNotFoundError(
+                f"No numbered question images found in {questions_dir.resolve()}.\n"
+                f"Add files like 1.png, 2.png, 3.png."
+            )
+
+        self._used: list[Path] = []
+        print_step("🗂 ", f"Question pool   : {[p.name for p in self._available]} "
+                          f"({len(self._available)} image(s))")
+
+    def pick(self) -> Path:
+        """
+        Randomly pick one image from the remaining pool, mark it as used,
+        and return its path.  Raises RuntimeError when the pool is empty.
+        """
+        if not self._available:
+            used_names = [p.name for p in self._used]
+            raise RuntimeError(
+                f"Question image pool is exhausted — all images have already "
+                f"been used in this run.\n"
+                f"Used : {used_names}\n"
+                f"Add more numbered images to the questions/ folder if you "
+                f"need additional picks."
+            )
+
+        chosen = random.choice(self._available)
+        self._available.remove(chosen)
+        self._used.append(chosen)
+
+        remaining = [p.name for p in self._available]
+        print_step("🎲", f"Picked question : {chosen.name}  "
+                         f"(remaining pool: {remaining or ['(empty)']}, "
+                         f"used: {[p.name for p in self._used]})")
+        return chosen
+
+
+class TransitionPool:
+    """
+    Manages a pool of transition audio files (1.mp3 … N.mp3) so that each
+    file is picked at most once per pipeline run.  This prevents the same
+    transition audio from repeating across the two review scenes within the
+    same video.
+
+    Usage
+    -----
+        pool = TransitionPool(TRANSITIONS_DIR)
+        path1 = pool.pick()   # e.g. 17.mp3  — now excluded
+        path2 = pool.pick()   # e.g.  3.mp3  — guaranteed different
+
+    Raises
+    ------
+    FileNotFoundError  – if the transitions/ folder is missing or empty.
+    RuntimeError       – if the pool is exhausted (all files already used).
+    """
+
+    _AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac"}
+
+    def __init__(self, transitions_dir: Path) -> None:
+        if not transitions_dir.exists():
+            raise FileNotFoundError(
+                f"The transitions/ folder does not exist.\n"
+                f"Expected it at: {transitions_dir.resolve()}\n"
+                f"Create the folder and drop your numbered mp3 files inside "
+                f"(1.mp3, 2.mp3, … 55.mp3)."
+            )
+
+        self._available: list[Path] = [
+            p for p in transitions_dir.iterdir()
+            if p.suffix.lower() in self._AUDIO_EXTENSIONS
+        ]
+
+        if not self._available:
+            raise FileNotFoundError(
+                f"No audio files found in {transitions_dir.resolve()}.\n"
+                f"Add numbered mp3 files (1.mp3 … 55.mp3) to that folder."
+            )
+
+        self._used: list[Path] = []
+        print_step("🗂 ", f"Transition pool : {len(self._available)} audio file(s) available")
+
+    def pick(self) -> Path:
+        """
+        Randomly pick one transition audio from the remaining pool, mark it
+        as used, and return its path.  Raises RuntimeError when the pool is
+        empty.
+        """
+        if not self._available:
+            used_names = [p.name for p in self._used]
+            raise RuntimeError(
+                f"Transition pool is exhausted — all audio files have already "
+                f"been used in this run.\n"
+                f"Used : {used_names}\n"
+                f"Add more audio files to the transitions/ folder."
+            )
+
+        chosen = random.choice(self._available)
+        self._available.remove(chosen)
+        self._used.append(chosen)
+
+        remaining_count = len(self._available)
+        print_step("🎲", f"Picked transition: {chosen.name}  "
+                         f"(used: {[p.name for p in self._used]}, "
+                         f"{remaining_count} remaining in pool)")
+        return chosen
+
+
 def run(difficulty: str) -> None:
     """Execute the full pipeline for the given difficulty level."""
+
+    # Initialise no-repeat pools once for the entire run.
+    question_pool   = QuestionImagePool(QUESTIONS_DIR)
+    transition_pool = TransitionPool(TRANSITIONS_DIR)
 
     # ── 1. Intro ──────────────────────────────────────────────────────────────
     print_step("🎬", "=== INTRO SCENE ===")
@@ -54,142 +206,87 @@ def run(difficulty: str) -> None:
     print_step("🏁", "=== DIFFICULTY SCENE ===")
     diff_silent, diff_audio = build_difficulty_scene(difficulty)
 
-    # ── 3. Question ───────────────────────────────────────────────────────────
-    #   Pass diff_silent so the question slides in ON TOP of the difficulty
-    #   image rather than over a plain black background.
-    print_step("❓", "=== QUESTION SCENE ===")
-    question_image = _resolve_question_image(difficulty)
-    print_step("🖼 ", f"Question image → {question_image}")
-    q_silent, q_audio = build_question_scene(
-        image_path=question_image,
+    # ── 3. Question 1 (with comment audio + subtitles) ────────────────────────
+    print_step("❓", "=== QUESTION 1 SCENE ===")
+    q1_image = question_pool.pick()
+    print_step("🖼 ", f"Question 1 image → {q1_image}")
+    q1_silent, q1_audio = build_question_scene(
+        image_path=q1_image,
         bg_clip=diff_silent,
         fps=OUTPUT_FPS,
-        comments_dir=COMMENTS_DIR,
+        comments_dir=COMMENTS_DIR,     # comment audio ON for Q1
     )
 
-    # ── 4. Review ─────────────────────────────────────────────────────────────
-    #   question_review.mp4 looped to the duration of a random transition audio.
-    #   Word-by-word subtitles from the transcription are pinned to the upper
-    #   quarter of the 9:16 frame.
-    print_step("🔍", "=== REVIEW SCENE ===")
-    _check_transitions_dir()
-    review_silent, review_audio = build_review_scene(
+    # ── 4. Review 1 ───────────────────────────────────────────────────────────
+    print_step("🔍", "=== REVIEW 1 SCENE ===")
+    review1_audio_path = transition_pool.pick()
+    review1_silent, review1_audio = build_review_scene(
         review_video_path=REVIEW_VIDEO_PATH,
-        transitions_dir=TRANSITIONS_DIR,
+        audio_path=review1_audio_path,
         fps=OUTPUT_FPS,
     )
 
-    # ── 5. Stitch ─────────────────────────────────────────────────────────────
-    print_step("🔗", "Stitching scenes  [ intro → difficulty → question → review ] ...")
+    # ── 5. Question 2 (no comment audio) ──────────────────────────────────────
+    #   Slides in on top of the last frame of review 1, full 9:16.
+    print_step("❓", "=== QUESTION 2 SCENE ===")
+    q2_image = question_pool.pick()
+    print_step("🖼 ", f"Question 2 image → {q2_image}")
+    q2_silent, q2_audio = build_question_scene(
+        image_path=q2_image,
+        bg_clip=review1_silent,        # freeze last frame of review 1
+        fps=OUTPUT_FPS,
+        comments_dir=None,             # comment audio OFF for Q2
+    )
+
+    # ── 6. Review 2 (different transition audio than review 1) ────────────────
+    print_step("🔍", "=== REVIEW 2 SCENE ===")
+    review2_audio_path = transition_pool.pick()   # pool excludes already-used file
+    review2_silent, review2_audio = build_review_scene(
+        review_video_path=REVIEW_VIDEO_PATH,
+        audio_path=review2_audio_path,
+        fps=OUTPUT_FPS,
+    )
+
+    # ── 7. Question 3 (no comment audio, no review follows) ───────────────────
+    #   Slides in on top of the last frame of review 2, full 9:16.
+    print_step("❓", "=== QUESTION 3 SCENE ===")
+    q3_image = question_pool.pick()
+    print_step("🖼 ", f"Question 3 image → {q3_image}")
+    q3_silent, q3_audio = build_question_scene(
+        image_path=q3_image,
+        bg_clip=review2_silent,        # freeze last frame of review 2
+        fps=OUTPUT_FPS,
+        comments_dir=None,             # comment audio OFF for Q3
+    )
+
+    # ── 8. Stitch ─────────────────────────────────────────────────────────────
+    print_step("🔗", "Stitching scenes  "
+                     "[ intro → difficulty → q1 → review1 → q2 → review2 → q3 ] ...")
     final = _stitch(
-        intro_silent,   intro_audio,
-        diff_silent,    diff_audio,
-        q_silent,       q_audio,
-        review_silent,  review_audio,
+        intro_silent,    intro_audio,
+        diff_silent,     diff_audio,
+        q1_silent,       q1_audio,
+        review1_silent,  review1_audio,
+        q2_silent,       q2_audio,
+        review2_silent,  review2_audio,
+        q3_silent,       q3_audio,
     )
     print(f"   Total duration : {final.duration:.2f} s")
 
-    # ── 6. Export ─────────────────────────────────────────────────────────────
+    # ── 9. Export ─────────────────────────────────────────────────────────────
     _export(final, difficulty)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _resolve_question_image(difficulty: str) -> Path:
-    """
-    Look for a question image inside the `questions/` folder.
-
-    Picks randomly from numbered images (1.png, 2.png, 3.png, …) if any
-    exist.  Falls back to difficulty-named and generic filenames if no
-    numbered files are found.
-
-    Resolution order:
-      1. Random pick from questions/<N>.png / <N>.jpg  (N is an integer)
-      2. questions/<difficulty>.png
-      3. questions/<difficulty>.jpg
-      4. questions/question.png
-      5. questions/question.jpg
-
-    Raises FileNotFoundError with a helpful message if nothing is found.
-    """
-    if not QUESTIONS_DIR.exists():
-        raise FileNotFoundError(
-            f"The questions/ folder does not exist.\n"
-            f"Expected it at: {QUESTIONS_DIR.resolve()}\n"
-            f"Create the folder and drop your question images inside it "
-            f"(e.g. 1.png, 2.png, 3.png)."
-        )
-
-    # ── 1. Prefer numbered images picked at random ─────────────────────────────
-    numbered = sorted(
-        [
-            p for p in QUESTIONS_DIR.iterdir()
-            if p.suffix.lower() in {".png", ".jpg"} and p.stem.isdigit()
-        ],
-        key=lambda p: int(p.stem),
-    )
-    if numbered:
-        chosen = random.choice(numbered)
-        print_step("🎲", f"Randomly selected question image: {chosen.name} "
-                         f"(pool: {[p.name for p in numbered]})")
-        return chosen
-
-    # ── 2. Fall back to named/generic images ──────────────────────────────────
-    candidates = [
-        QUESTIONS_DIR / f"{difficulty}.png",
-        QUESTIONS_DIR / f"{difficulty}.jpg",
-        QUESTIONS_DIR / "question.png",
-        QUESTIONS_DIR / "question.jpg",
-    ]
-    for path in candidates:
-        if path.exists():
-            return path
-
-    found = [p.name for p in QUESTIONS_DIR.iterdir()]
-    raise FileNotFoundError(
-        f"No question image found for difficulty '{difficulty}'.\n"
-        f"Looked in : {QUESTIONS_DIR.resolve()}\n"
-        f"Tried     : numbered files (1.png/jpg …), "
-        f"{[p.name for p in candidates]}\n"
-        f"Found     : {found or ['(empty folder)']}"
-    )
-
-
-def _check_transitions_dir() -> None:
-    """
-    Raise a descriptive FileNotFoundError if the transitions/ folder is
-    missing or contains no audio files, so the user gets a clear message
-    rather than a bare exception from pick_random_file().
-    """
-    if not TRANSITIONS_DIR.exists():
-        raise FileNotFoundError(
-            f"The transitions/ folder does not exist.\n"
-            f"Expected it at: {TRANSITIONS_DIR.resolve()}\n"
-            f"Create the folder and drop your numbered mp3 files inside "
-            f"(1.mp3, 2.mp3, … 55.mp3)."
-        )
-
-    audio_extensions = {".mp3", ".wav", ".m4a", ".aac"}
-    audio_files = [
-        p for p in TRANSITIONS_DIR.iterdir()
-        if p.suffix.lower() in audio_extensions
-    ]
-    
-    if not audio_files:
-        raise FileNotFoundError(
-            f"No audio files found in {TRANSITIONS_DIR.resolve()}.\n"
-            f"Add numbered mp3 files (1.mp3 … 55.mp3) to that folder."
-        )
-
-    print(f"   Transitions dir: {TRANSITIONS_DIR.resolve()}  "
-          f"({len(audio_files)} audio file(s) available)")
-
-
 def _stitch(
-    intro_silent,   intro_audio,
-    diff_silent,    diff_audio,
-    q_silent,       q_audio,
-    review_silent,  review_audio,
+    intro_silent,    intro_audio,
+    diff_silent,     diff_audio,
+    q1_silent,       q1_audio,
+    review1_silent,  review1_audio,
+    q2_silent,       q2_audio,
+    review2_silent,  review2_audio,
+    q3_silent,       q3_audio,
 ):
     """
     Concatenate video and audio tracks independently before recombining.
@@ -197,14 +294,30 @@ def _stitch(
     MoviePy 2.x does not reliably carry audio through CompositeVideoClip /
     ImageClip chains, so tracks are joined separately then merged.
 
-    Scene order:  intro  →  difficulty  →  question  →  review
+    Scene order: intro → difficulty → q1 → review1 → q2 → review2 → q3
     """
     final_video = concatenate_videoclips(
-        [intro_silent, diff_silent, q_silent, review_silent],
+        [
+            intro_silent,
+            diff_silent,
+            q1_silent,
+            review1_silent,
+            q2_silent,
+            review2_silent,
+            q3_silent,
+        ],
         method="compose",
     )
     final_audio = concatenate_audioclips(
-        [intro_audio, diff_audio, q_audio, review_audio]
+        [
+            intro_audio,
+            diff_audio,
+            q1_audio,
+            review1_audio,
+            q2_audio,
+            review2_audio,
+            q3_audio,
+        ]
     )
     return final_video.with_audio(final_audio)
 
