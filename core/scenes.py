@@ -28,6 +28,9 @@ build_review_scene     – question_review/question_review.mp4 looped to match a
                          The audio is transcribed and rendered as word-by-word
                          subtitles dead-centre horizontally, 30 % from the top
                          of the 9:16 frame.
+build_outro_scene      – random video from outro_scene/videos/ + random audio
+                         from outro_scene/audios/ + word-synced subtitles.
+                         Mirrors build_intro_scene exactly with different paths.
 """
 
 import math
@@ -429,6 +432,62 @@ def build_review_scene(
     ).with_duration(scene_duration).with_fps(fps)
 
     return review_silent, audio_clip
+
+
+def build_outro_scene() -> tuple[CompositeVideoClip, AudioFileClip]:
+    """
+    Build the outro scene.
+
+    Mirrors build_intro_scene exactly, but draws media from a dedicated
+    outro_scene/ folder:
+
+        outro_scene/
+            videos/   1.mp4          (fixed video — always picked)
+            audios/   1.mp3, 2.mp3 … (random pick, same as intro)
+
+    Steps:
+      1. Pick the video from outro_scene/videos/.
+      2. Pick a random audio file from outro_scene/audios/.
+      3. Transcribe the audio with Whisper.
+      4. Reframe the video to 9:16 and loop it to match audio length.
+      5. Render word-by-word subtitle clips.
+      6. Composite everything into a single silent clip.
+
+    Returns
+    -------
+    (silent_composite, audio_clip)
+    """
+    OUTRO_DIR        = Path(__file__).parent.parent / "outro_scene"
+    outro_videos_dir = OUTRO_DIR / "videos"
+    outro_audios_dir = OUTRO_DIR / "audios"
+
+    print_step("📹", "Picking outro video...")
+    video_path = pick_random_file(outro_videos_dir, [".mp4", ".mov", ".avi", ".mkv"])
+
+    print_step("🎵", "Picking outro audio...")
+    audio_path = pick_random_file(outro_audios_dir, [".mp3", ".wav", ".m4a", ".aac"])
+
+    print_step("🎙", "Transcribing outro audio for subtitles...")
+    words = transcribe_words(audio_path)
+
+    print_step("🎬", f"Reframing outro video to 9:16 ({OUT_W}×{OUT_H})...")
+    video_clip = _load_and_reframe_video(video_path)
+
+    audio_clip = AudioFileClip(str(audio_path))
+    print(f"   Audio duration : {audio_clip.duration:.2f} s")
+
+    looped_silent = loop_clip_to(video_clip.without_audio(), audio_clip.duration)
+
+    print_step("📝", "Rendering outro word-by-word subtitles...")
+    subtitle_clips = build_subtitle_clips(words)
+
+    print_step("🎞", "Compositing outro layers...")
+    outro_silent = CompositeVideoClip(
+        [looped_silent, *subtitle_clips],
+        size=(OUT_W, OUT_H),
+    ).with_duration(audio_clip.duration)
+
+    return outro_silent, audio_clip
 
 
 # ── Private helpers ────────────────────────────────────────────────────────────

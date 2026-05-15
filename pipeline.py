@@ -15,9 +15,11 @@ Orchestrates the full reel-generation pipeline.
                                        random transition audio + upper-quarter subtitles)
         7.  Build question 3 scene    (PNG slide-in, full 9:16, no comment audio,
                                        no review follows)
-        8.  Stitch all seven scenes   intro → difficulty → q1 → review1 →
-                                       q2 → review2 → q3
-        9.  Export to output/reel_<difficulty>.mp4
+        8.  Build outro scene         (video + random audio + subtitles, from
+                                       outro_scene/videos/ and outro_scene/audios/)
+        9.  Stitch all eight scenes   intro → difficulty → q1 → review1 →
+                                       q2 → review2 → q3 → outro
+        10. Export to output/reel_<difficulty>.mp4
 """
 
 import os
@@ -32,6 +34,7 @@ from core.scenes import (
     build_difficulty_scene,
     build_question_scene,
     build_review_scene,
+    build_outro_scene,
 )
 from utils import print_step
 
@@ -259,9 +262,13 @@ def run(difficulty: str) -> None:
         comments_dir=None,             # comment audio OFF for Q3
     )
 
-    # ── 8. Stitch ─────────────────────────────────────────────────────────────
+    # ── 8. Outro ──────────────────────────────────────────────────────────────
+    print_step("🎬", "=== OUTRO SCENE ===")
+    outro_silent, outro_audio = build_outro_scene()
+
+    # ── 9. Stitch ─────────────────────────────────────────────────────────────
     print_step("🔗", "Stitching scenes  "
-                     "[ intro → difficulty → q1 → review1 → q2 → review2 → q3 ] ...")
+                     "[ intro → difficulty → q1 → review1 → q2 → review2 → q3 → outro ] ...")
     final = _stitch(
         intro_silent,    intro_audio,
         diff_silent,     diff_audio,
@@ -270,10 +277,11 @@ def run(difficulty: str) -> None:
         q2_silent,       q2_audio,
         review2_silent,  review2_audio,
         q3_silent,       q3_audio,
+        outro_silent,    outro_audio,
     )
     print(f"   Total duration : {final.duration:.2f} s")
 
-    # ── 9. Export ─────────────────────────────────────────────────────────────
+    # ── 10. Export ────────────────────────────────────────────────────────────
     _export(final, difficulty)
 
 
@@ -287,6 +295,7 @@ def _stitch(
     q2_silent,       q2_audio,
     review2_silent,  review2_audio,
     q3_silent,       q3_audio,
+    outro_silent,    outro_audio,
 ):
     """
     Concatenate video and audio tracks independently before recombining.
@@ -294,7 +303,7 @@ def _stitch(
     MoviePy 2.x does not reliably carry audio through CompositeVideoClip /
     ImageClip chains, so tracks are joined separately then merged.
 
-    Scene order: intro → difficulty → q1 → review1 → q2 → review2 → q3
+    Scene order: intro → difficulty → q1 → review1 → q2 → review2 → q3 → outro
     """
     final_video = concatenate_videoclips(
         [
@@ -305,6 +314,7 @@ def _stitch(
             q2_silent,
             review2_silent,
             q3_silent,
+            outro_silent,
         ],
         method="compose",
     )
@@ -317,6 +327,7 @@ def _stitch(
             q2_audio,
             review2_audio,
             q3_audio,
+            outro_audio,
         ]
     )
     return final_video.with_audio(final_audio)
